@@ -6,7 +6,7 @@ import gzip
 import json
 import argparse
 import ipaddress
-from datetime import datetime
+from datetime import datetime, timezone
 
 WEB_LOG_DIR = "/srv/db"
 LOG_DIR = "/srv/cowrie/var/log/cowrie"
@@ -107,13 +107,13 @@ def filter_timeline(timeline, start=None, end=None):
     filtered_timeline = []
 
     try:
-        start_dt = datetime.fromisoformat(start) if start else None
-        end_dt = datetime.fromisoformat(end) if end else None
+        start_dt = parse_iso(start) if start else None
+        end_dt = parse_iso(end) if end else None
     except ValueError as e:
         print(f'Invalid ISO date error: {e}')
 
     for ts, sid, msg, is_request, ip in timeline:
-        ts_dt = datetime.fromisoformat(ts)
+        ts_dt = parse_iso(ts)
         if start_dt and ts_dt < start_dt:
             continue
         if end_dt and ts_dt > end_dt:
@@ -121,6 +121,23 @@ def filter_timeline(timeline, start=None, end=None):
         filtered_timeline.append((ts, sid, msg, is_request, ip))
 
     return filtered_timeline
+
+
+def parse_iso(ts_str):
+    if ts_str is None:
+        return None
+    ts_str = ts_str.strip()
+    if ts_str.endswith('Z'):
+        ts_str = ts_str[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        # ensure all datetimes are offset-aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
 
 
 def main():
@@ -158,7 +175,7 @@ def main():
         start_time = timeline[0][0] if timeline else None
         end_time = timeline[-1][0] if timeline else None
         if start_time and end_time:
-            duration = datetime.fromisoformat(end_time) - datetime.fromisoformat(start_time)
+            duration = parse_iso(end_time) - parse_iso(start_time)
             hours, remainder = divmod(duration.total_seconds(), 3600)
             minutes, seconds = divmod(remainder, 60)
             dur_str = f'{int(hours)}h {int(minutes)}m {int(seconds)}s'
