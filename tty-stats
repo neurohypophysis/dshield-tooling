@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+
+import os
+import json
+import struct
+import argparse
+import glob
+import gzip
+from collections import Counter, defaultdict
+from statistics import mean
+
+TTY_DIR = "/srv/cowrie/var/lib/cowrie/tty/"
+LOG_DIR = "/srv/cowrie/var/log/cowrie"
+
+# Cowrie TTY constants (from playlog.py)
+OP_OPEN = 1
+OP_CLOSE = 2
+OP_WRITE = 3
+OP_EXEC = 4
+
+TYPE_INPUT = 1
+TYPE_OUTPUT = 2
+TYPE_INTERACT = 3
+
+RECORD_STRUCT = "<iLiiLL"
+RECORD_SIZE = struct.calcsize(RECORD_STRUCT)
+
+
+def parse_tty_file(path):
+    events = []
+    with open(path, "rb") as f:
+        while True:
+            header = f.read(RECORD_SIZE)
+            if not header:
+                break
+            try:
+                op, tty, length, direction, sec, usec = struct.unpack(RECORD_STRUCT, header)
+            except struct.error:
+                break
+            data = f.read(length)
+            if op == OP_WRITE:
+                ts = sec + usec / 1_000_000
+                try:
+                    text = data.decode(errors="replace")
+                except Exception:
+                    text = repr(data)
+                events.append({
+                    "timestamp": ts,
+                    "tty": tty,
+                    "direction": direction,
+                    "data": text
+                })
+            elif op == OP_CLOSE:
+                break
+    return events
+
+
+def load_metadata(logdir):
+    metadata = {}
+    for fpath in glob.glob(os.path.join(logdir, "*json*")):
+        open_func = gzip.open if fpath.endswith(".gz") else open
+        try:
+            with open_func(fpath, "rt", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ttylog = entry.get("ttylog") or entry.get("shasum")
+                    if ttylog:
+                        tty_file = os.path.basename(ttylog)
+                        metadata[tty_file] = entry
+        except (OSError, IOError) as e:
+            print(f"Warning: Could not read {fpath}: {e}")
+    return metadata
+
+
+def print_metadata(fname, metadata):
+    entry = metadata.get(fname)
+    if entry:
+        print("Metadata:")
+        for key in ["eventid", "src_ip", "timestamp", "duration", "size"]:
+            if key in entry:
+                print(f"  {key}: {entry[key]}")
+    else:
+        print("Metadata: Not found")
+
+
+def filter_mode(args, metadata):
+    search_type = args.type.lower() if args.type else None
+    contains = args.contains.lower() if args.contains else None
+
+    for fname in os.listdir(TTY_DIR):
+        fpath = os.path.join(TTY_DIR, fname)
+        if not os.path.isfile(fpath):
+            continue
+
+        events = parse_tty_file(fpath)
+        matching_events = []
+        for ev in events:
+            ev_type = {TYPE_INPUT: "input", TYPE_OUTPUT: "output", TYPE_INTERACT: "interact"}.get(ev["direction"], "unknown")
+            type_match = (not search_type) or (search_type in ev_type)
+            contains_match = (not contains) or (contains in ev["data"].lower())
+            if type_match and contains_match:
+                matching_events.append(ev)
+
+        if matching_events:
+            print(f"=== Session {fname} ===")
+            print_metadata(fname, metadata)
+            for ev in matching_events[:10]:
+                print(f"  [{ev['timestamp']:.6f}] {ev['data'].strip()}")
+            print()
+
+
+def stats_mode(metadata):
+    print("=== Cowrie Honeypot TTY Statistics ===\n")
+
+    sessions = [f for f in os.listdir(TTY_DIR) if os.path.isfile(os.path.join(TTY_DIR, f))]
+    print(f"Total sessions: {len(sessions)}\n")
+
+    ip_counts = Counter()
+    for entry in metadata.values():
+        if "src_ip" in entry:
+            ip_counts[entry["src_ip"]] += 1
+    if ip_counts:
+        print("Top Source IPs:")
+        for ip, count in ip_counts.most_common(10):
+            print(f"  {ip}: {count}")
+        print()
+
+    cmd_counts = Counter()
+    session_lengths = []
+    for fname in sessions:
+        fpath = os.path.join(TTY_DIR, fname)
+        events = parse_tty_file(fpath)
+        if not events:
+            continue
+        for ev in events:
+            if ev["direction"] == TYPE_INPUT:
+                line = ev["data"].strip()
+                if line:
+                    cmd_counts[line.split()[0]] += 1
+        session_length = events[-1]["timestamp"] - events[0]["timestamp"]
+        if session_length >= 0:
+            session_lengths.append(session_length)
+
+    if cmd_counts:
+        print("Top Commands:")
+        for cmd, count in cmd_counts.most_common(20):
+            print(f"  {cmd}: {count}")
+        print()
+
+    if session_lengths:
+        total_length = sum(session_lengths)
+        print("Session Lengths (seconds):")
+        print(f"  Average: {mean(session_lengths):.2f}")
+        print(f"  Max: {max(session_lengths):.2f}")
+        print(f"  Min: {min(session_lengths):.2f}")
+        print(f"  Cumulative: {total_length:.2f}")
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze Cowrie TTY logs with metadata.")
+    parser.add_argument("-t", "--type", help="Filter by event type: input, output, interact")
+    parser.add_argument("-c", "--contains", help="Filter by substring in TTY event data")
+    parser.add_argument("--debug", action="store_true", help="Print first few parsed events and exit")
+    args = parser.parse_args()
+
+    metadata = load_metadata(LOG_DIR)
+
+    if args.debug:
+        tty_files = [f for f in os.listdir(TTY_DIR) if os.path.isfile(os.path.join(TTY_DIR, f))]
+        if tty_files:
+            first_file = tty_files[0]
+            events = parse_tty_file(os.path.join(TTY_DIR, first_file))
+            print(f"Debug: First 5 events from {first_file}:")
+            for ev in events[:5]:
+                print(ev)
+        return
+
+    if args.type or args.contains:
+        filter_mode(args, metadata)
+    else:
+        stats_mode(metadata)
+
+
+if __name__ == "__main__":
+    main()

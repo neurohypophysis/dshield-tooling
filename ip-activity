@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+import sys
+import os
+import glob
+import gzip
+import json
+import argparse
+import ipaddress
+from datetime import datetime
+
+WEB_LOG_DIR = "/srv/db"
+LOG_DIR = "/srv/cowrie/var/log/cowrie"
+TTY_DIR = "/srv/cowrie/var/lib/cowrie/tty"
+DOWNLOAD_DIR = "/srv/cowrie/var/lib/cowrie/downloads"
+
+def load_json_logs(logdir, target_net):
+    events = []
+    for fpath in glob.glob(os.path.join(logdir, "*json*")):
+        opener = gzip.open if fpath.endswith(".gz") else open
+        try:
+            with opener(fpath, "rt", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ip = entry.get("src_ip")
+                    if not ip:
+                        continue
+                    try:
+                        if ipaddress.ip_address(ip) in target_net:
+                            events.append(entry)
+                    except ValueError:
+                        continue
+        except Exception as e:
+            print(f"Warning: failed to read {fpath}: {e}")
+    return events
+
+
+def load_web_json_logs(logdir, target_net):
+    events = []
+    for fpath in glob.glob(os.path.join(logdir, "*.json*")):
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    entry = json.loads(line)
+                except Exception as e:
+                    print(f"{fpath}:{line_num}: JSON parse failed: {e!r} line={line!r}", file=sys.stderr)
+                    continue
+
+                if not isinstance(entry, dict):
+                    print(f"{fpath}:{line_num}: Skipping non-dict entry: {entry!r}", file=sys.stderr)
+                    continue
+
+                ip = entry.get("sip")
+                if not ip:
+                    continue
+
+                try:
+                    if ipaddress.ip_address(ip) not in target_net:
+                        continue
+                except ValueError:
+                    continue
+
+                ts = entry.get("time")
+                try:
+                    ts = datetime.fromisoformat(ts).isoformat()
+                except Exception:
+                    pass  # leave ts as-is
+
+                method = entry.get("method", "?")
+                url = entry.get("url", "?")
+                status = (entry.get("response_id") or {}).get("status_code", "?")
+
+
+                msg = f"HTTP {method} {url} (status {status})"
+
+                events.append({
+                    "timestamp": ts,
+                    "session": None,
+                    "request": True,
+                    "event": msg,
+                    "src_ip": ip
+                })
+    return events
+
+
+def build_timeline(events, cidr_range=False):
+    timeline = []
+
+    for ev in events:
+        ts = ev.get("timestamp")
+        msg = ev.get("message") or ev.get("eventid") or ev.get("event")
+        sid = ev.get("session")
+        is_request = ev.get("request", False)
+        ip = ev.get("src_ip") if cidr_range else None
+        timeline.append((ts, sid, msg, is_request, ip))
+    
+    return sorted(timeline, key=lambda x: x[0])
+
+
+def filter_timeline(timeline, start=None, end=None):
+    filtered_timeline = []
+
+    try:
+        start_dt = datetime.fromisoformat(start) if start else None
+        end_dt = datetime.fromisoformat(end) if end else None
+    except ValueError as e:
+        print(f'Invalid ISO date error: {e}')
+
+    for ts, sid, msg, is_request, ip in timeline:
+        ts_dt = datetime.fromisoformat(ts)
+        if start_dt and ts_dt < start_dt:
+            continue
+        if end_dt and ts_dt > end_dt:
+            continue
+        filtered_timeline.append((ts, sid, msg, is_request, ip))
+
+    return filtered_timeline
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build timeline of activity for an IP or CIDR block in Cowrie logs.")
+    parser.add_argument("target", help="IP address or CIDR block")
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    parser.add_argument("--csv", action="store_true", help="Output in CSV format")
+    parser.add_argument("--start", "-s", help="Start time (ISO format, e.g., 2025-08-24T00:00:00)")
+    parser.add_argument("--end", "-e", help="End time (ISO format, e.g., 2025-08-24T23:59:59)")
+    
+    args = parser.parse_args()
+
+    target_net = ipaddress.ip_network(args.target, strict=False)
+    cidr_range = target_net.num_addresses > 1
+
+    events = []
+    events.extend(load_json_logs(LOG_DIR, target_net))
+    events.extend(load_web_json_logs(WEB_LOG_DIR, target_net))
+    timeline = build_timeline(events, cidr_range)
+
+    
+    num_sessions = len({sid for _, sid, _, _, _ in timeline if sid})
+    num_requests = len([1 for _, _, _, is_req, _ in timeline if is_req]) # slightly regretting using tuples right here
+
+    unique_ips = {ip for _, _, _, _, ip in timeline if ip} if cidr_range else set()
+
+    if not timeline:
+        print(f'No activity found for {target_net}')
+    else:
+        if args.start or args.end:
+            timeline = filter_timeline(timeline, args.start, args.end)
+
+        print(f"Sessions: {num_sessions}, HTTP Requests: {num_requests}", file=sys.stderr)
+
+        start_time = timeline[0][0] if timeline else None
+        end_time = timeline[-1][0] if timeline else None
+        if start_time and end_time:
+            duration = datetime.fromisoformat(end_time) - datetime.fromisoformat(start_time)
+            hours, remainder = divmod(duration.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            dur_str = f'{int(hours)}h {int(minutes)}m {int(seconds)}s'
+            print(f"Time Range: {start_time} → {end_time} ({dur_str})", file=sys.stderr)
+        
+        if cidr_range:
+            print(f'\nUnique addresses for {target_net}: {len(unique_ips)}', file=sys.stderr)
+
+        print()
+
+        if args.json:
+            output = []
+            for ts, sid, msg, is_request, ip in timeline:
+                entry = {"timestamp": ts, "event": msg}
+                if sid is not None:
+                    entry["session"] = sid
+                elif is_request:
+                    entry["request"] = True
+                if cidr_range and ip:
+                    entry["src_ip"] = ip
+                output.append(entry)
+            print(json.dumps(output, indent=2))
+
+        elif args.csv:
+            print('timestamp,session,message,web_request,ip_address', file=sys.stderr)
+            for ts, sid, msg, is_request, ip in timeline:
+                print(f"{ts},{sid},{msg},{is_request},{ip}")
+
+        else:
+            for ts, sid, msg, _, ip in timeline:
+                label = f"session {sid}" if sid else "web request"
+                ip_str = f" ({ip})" if cidr_range and ip else ""
+                print(f"{ts} [{label}]{ip_str} {msg}")
+        
+
+if __name__ == "__main__":
+    main()

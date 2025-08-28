@@ -1,0 +1,288 @@
+#!/bin/bash
+
+DOWNLOAD_DIR="/srv/cowrie/var/lib/cowrie/downloads"
+LOG_DIR="/srv/cowrie/var/log/cowrie"
+
+show_help() {
+    cat <<EOF
+Usage: $0 [options]
+
+Options:
+  -t, --type <pattern>       Filter files by type (case-insensitive match)
+  -c, --contains <pattern>   Filter files by content (case-insensitive match)
+      --no-elevate           Do not use sudo to read restricted files (unreadable files will be counted and reported)
+  -h, --help                 Show this help message and exit
+
+Examples:
+  $0 -t ascii
+  $0 -t ascii -c "password"
+  $0 -c "malware" --no-elevate
+EOF
+}
+
+TYPE_REGEX=""
+CONTAINS_FILTER=""
+NO_ELEVATE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--type)
+            TYPE_REGEX="$2"
+            shift 2
+            ;;
+        -c|--contains)
+            CONTAINS_FILTER="$2"
+            shift 2
+            ;;
+        --no-elevate)
+            NO_ELEVATE=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use -h or --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+
+
+echo "=== Cowrie Honeypot Upload Statistics ==="
+echo "Target Directory: $DOWNLOAD_DIR"
+echo
+
+
+total_files=$(find "$DOWNLOAD_DIR" -type f | wc -l)
+echo "Total files: $total_files"
+echo
+
+log_to_json() {
+    local log_line="$1"
+
+    local sha256_regex='^([0-9T:.Z+-]+) \[HoneyPotSSHTransport,[^,]+,([^]]+)\].*SHA-256 ([0-9a-f]+).*$'
+    local sftp_regex='^([0-9T:.Z+-]+) \[HoneyPotSSHTransport,[^,]+,([^]]+)\].*SFTP Uploaded file.*to.*$'
+
+    if [[ "$log_line" =~ $sha256_regex ]]; then
+        local ts="${BASH_REMATCH[1]}"
+        local src_ip="${BASH_REMATCH[2]}"
+        local shasum="${BASH_REMATCH[3]}"
+        local outfile="$shasum"
+
+        jq -n \
+            --arg timestamp "$ts" \
+            --arg src_ip "$src_ip" \
+            --arg event "file_upload" \
+            --arg shasum "$shasum" \
+            --arg outfile "$outfile" \
+            '{
+                timestamp: $timestamp,
+                src_ip: $src_ip,
+                eventid: $event,
+                shasum: $shasum,
+                outfile: $outfile
+            }'
+        return
+    elif [[ "$log_line" =~ $sftp_regex ]]; then
+        local ts="${BASH_REMATCH[1]}"
+        local src_ip="${BASH_REMATCH[2]}"
+        local shasum=""
+        local outfile=""
+
+        if [[ "$log_line" =~ SHA-256\ ([0-9a-f]+) ]]; then
+            shasum="${BASH_REMATCH[1]}"
+            outfile="$shasum"
+        else
+            if [[ "$log_line" =~ to\ var/lib/cowrie/downloads/?([^ ]+) ]]; then
+                outfile="${BASH_REMATCH[1]}"
+                shasum="$outfile"
+            fi
+        fi
+
+        jq -n \
+            --arg timestamp "$ts" \
+            --arg src_ip "$src_ip" \
+            --arg event "file_upload" \
+            --arg shasum "$shasum" \
+            --arg outfile "$outfile" \
+            '{
+                timestamp: $timestamp,
+                src_ip: $src_ip,
+                eventid: $event,
+                shasum: $shasum,
+                outfile: $outfile
+            }'
+        return
+    else
+        echo "$log_line"
+    fi
+}
+
+get_metadata() {
+    local filename="$1"
+    local logdir="$2"
+    local metadata_lines
+
+    metadata_lines=$(grep -h "\"shasum\": \"$filename\"" "$logdir"/cowrie.json* 2>/dev/null)
+    if [[ -n "$metadata_lines" ]]; then
+        echo "$metadata_lines"
+        return
+    fi
+
+    grep -a -h "$filename" "$logdir"/cowrie.log* 2>/dev/null | while read -r line; do
+        log_to_json "$line"
+    done
+}
+
+
+
+search_term=""
+if [[ -n "$TYPE_REGEX" ]]; then
+    search_term=$(echo "$TYPE_REGEX" | tr '[:upper:]' '[:lower:]')
+fi
+contains_term="$CONTAINS_FILTER"
+
+sudo_available=false
+if [[ "$NO_ELEVATE" != true && -x "$(command -v sudo)" ]]; then
+    if sudo -n true 2>/dev/null; then
+        sudo_available=true
+    else
+        # sudo exists but would prompt for a password; warn and treat as unavailable
+        echo "Note: sudo would prompt for a password; unreadable files will be counted unless you run with elevation."
+        sudo_available=false
+    fi
+fi
+
+if [[ -n "$search_term" || -n "$contains_term" ]]; then
+    echo "=== Matching Files with Metadata ==="
+    echo
+
+    unreadable_count=0
+
+    while IFS= read -r filepath; do
+        filename=$(basename "$filepath")
+        filetype=$(file "$filepath" | cut -d : -f 2- | sed 's/^[[:space:]]*//')
+        filetype_lc=$(echo "$filetype" | tr '[:upper:]' '[:lower:]')
+
+        matches_type=true
+        matches_contains=true
+
+        if [[ -n "$search_term" ]]; then
+            if [[ "$filetype_lc" != *"$search_term"* ]]; then
+                matches_type=false
+            fi
+        fi
+
+        if [[ -n "$contains_term" ]]; then
+            if [[ -r "$filepath" ]]; then
+                if ! grep -aqi -- "$contains_term" "$filepath" 2>/dev/null; then
+                    matches_contains=false
+                fi
+            else
+                if [[ "$NO_ELEVATE" == true || "$sudo_available" != true ]]; then
+                    ((unreadable_count++))
+                    matches_contains=false
+                else
+                    if ! sudo -n grep -aqi -- "$contains_term" "$filepath" 2>/dev/null; then
+                        matches_contains=false
+                    fi
+                fi
+            fi
+        fi
+
+        if [[ "$matches_type" == true && "$matches_contains" == true ]]; then
+            filesize=$(stat -c "%s" "$filepath")
+            perms=$(stat -c "%a" "$filepath")
+            echo "File:    $filepath"
+            echo "Size:    $(numfmt --to=iec $filesize) ($filesize bytes)"
+            echo "Perms:   $perms"
+            echo "Type:    $filetype"
+
+            metadata=$(get_metadata "$filename" "$LOG_DIR")
+            if [[ -n "$metadata" ]]; then
+                echo "$metadata" | jq -c '.' 2>/dev/null | while read -r meta_line; do
+                    if [[ -z "$meta_line" ]]; then
+                        # print raw metadata (one-liner)
+                        echo "Raw Log Info: $metadata"
+                        echo
+                        break
+                    fi
+
+                    event=$(echo "$meta_line" | jq -r '.eventid // empty' 2>/dev/null)
+                    src_ip=$(echo "$meta_line" | jq -r '.src_ip // empty' 2>/dev/null)
+                    url=$(echo "$meta_line" | jq -r '.url // empty' 2>/dev/null)
+                    ts=$(echo "$meta_line" | jq -r '.timestamp // empty' 2>/dev/null)
+
+                    if [[ -n "$event" ]]; then
+                        echo "Event:   $event"
+                        [[ -n "$src_ip" ]] && echo "Source:  $src_ip"
+                        [[ -n "$url" ]] && echo "URL:     $url"
+                        [[ -n "$ts" ]] && echo "Time:    $ts"
+                        echo
+                    else
+                        echo "Raw Log Info: $meta_line"
+                        echo
+                    fi
+                done
+            else
+                echo "Metadata: Not found in logs"
+                echo
+            fi
+        fi
+
+    done < <(find "$DOWNLOAD_DIR" -type f)
+
+    if [[ $unreadable_count -gt 0 ]]; then
+        echo "$unreadable_count Files Unreadable"
+    fi
+
+    exit 0
+fi
+
+
+
+echo "Top file types:"
+find "$DOWNLOAD_DIR" -type f -exec file {} + \
+  | cut -d : -f 2 \
+  | sed 's/^[[:space:]]*//' \
+  | sort \
+  | uniq -c \
+  | sort -nr \
+  | head -20 
+echo
+
+echo "File size statistics:"
+echo
+total_size=$(find "$DOWNLOAD_DIR" -type f -printf "%s\n" | awk '{s+=$1} END {print s}')
+echo "Total size: $(numfmt --to=iec $total_size) ($total_size bytes)"
+
+if [ "$total_files" -gt 0 ]; then
+  avg_size=$(( total_size / total_files ))
+  echo "Average file size: $(numfmt --to=iec $avg_size) ($avg_size bytes)"
+else
+  echo "Average file size: N/A (no files)"
+fi
+
+echo "Largest file:"
+largest_info=$(find "$DOWNLOAD_DIR" -type f -exec du -b {} + | sort -nr | head -1)
+largest_size=$(echo "$largest_info" | awk '{print $1}')
+largest_path=$(echo "$largest_info" | cut -f2-)
+largest_type=$(file "$largest_path" | cut -d : -f 2- | sed 's/^[[:space:]]*//')
+echo -e "Path:   $largest_path"
+echo -e "Size:   $(numfmt --to=iec $largest_size) ($largest_size bytes)"
+echo -e "Type:   $largest_type"
+echo
+
+echo "Smallest file:"
+smallest_info=$(find "$DOWNLOAD_DIR" -type f -exec du -b {} + | sort -n | head -1)
+smallest_size=$(echo "$smallest_info" | awk '{print $1}')
+smallest_path=$(echo "$smallest_info" | cut -f2-)
+smallest_type=$(file "$smallest_path" | cut -d : -f 2- | sed 's/^[[:space:]]*//')
+echo -e "Path:   $smallest_path"
+echo -e "Size:   $(numfmt --to=iec $smallest_size) ($smallest_size bytes)"
+echo -e "Type:   $smallest_type"
+echo
