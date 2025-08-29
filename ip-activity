@@ -142,7 +142,7 @@ def parse_iso(ts_str):
 
 def main():
     parser = argparse.ArgumentParser(description="Build timeline of activity for an IP or CIDR block in Cowrie logs.")
-    parser.add_argument("target", help="IP address or CIDR block")
+    parser.add_argument("targets", nargs='+', help="IP addresses or CIDR blocks")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     parser.add_argument("--csv", action="store_true", help="Output in CSV format")
     parser.add_argument("--start", "-s", help="Start time (ISO format, e.g., 2025-08-24T00:00:00)")
@@ -150,12 +150,29 @@ def main():
     
     args = parser.parse_args()
 
-    target_net = ipaddress.ip_network(args.target, strict=False)
-    cidr_range = target_net.num_addresses > 1
-
     events = []
-    events.extend(load_json_logs(LOG_DIR, target_net))
-    events.extend(load_web_json_logs(WEB_LOG_DIR, target_net))
+    targets_set = set()
+
+    cidr_range = len(set(args.targets)) > 1
+
+
+    if len(args.targets) > 1:
+        cidr_range = True
+
+    for target in args.targets:
+        try:
+            target_net = ipaddress.ip_network(target, strict=False)
+            targets_set.add(target_net)
+        except ValueError:
+            print(f"Invalid target: {target}", file=sys.stderr)
+            continue
+
+        if target_net.num_addresses > 1:
+            cidr_range = True
+
+        events.extend(load_json_logs(LOG_DIR, target_net))
+        events.extend(load_web_json_logs(WEB_LOG_DIR, target_net))
+
     timeline = build_timeline(events, cidr_range)
 
     
@@ -165,7 +182,7 @@ def main():
     unique_ips = {ip for _, _, _, _, ip in timeline if ip} if cidr_range else set()
 
     if not timeline:
-        print(f'No activity found for {target_net}')
+        print(f'No activity found for {", ".join(str(net) for net in targets_set)}')
     else:
         if args.start or args.end:
             timeline = filter_timeline(timeline, args.start, args.end)
@@ -182,7 +199,7 @@ def main():
             print(f"Time Range: {start_time} → {end_time} ({dur_str})", file=sys.stderr)
         
         if cidr_range:
-            print(f'\nUnique addresses for {target_net}: {len(unique_ips)}', file=sys.stderr)
+            print(f'\nUnique addresses for {", ".join(str(net) for net in targets_set)}: {len(unique_ips)}', file=sys.stderr)
 
         print()
 
