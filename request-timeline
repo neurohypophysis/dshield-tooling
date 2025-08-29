@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# needed so that the location of the awk script can be identified as relative to this script's location.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
   cat <<EOF
 Usage: $0 [options] logfile.jsonl
@@ -88,97 +91,6 @@ esac
 
 
 
-jq -r 'if type=="array" then .[] else . end | .time // .timestamp' "$input" | awk -v start="$START_TS" -v end="$END_TS" -v interval="$INTERVAL" -v nohist="$NO_HISTOGRAM" -v fill_empty="$FILL_EMPTY" '
-function in_range(ts) {
-  return (start == "" || ts >= start) && (end == "" || ts <= end)
-}
-
-function truncate_ts(ts, cmd, out) {
-  if (interval == "minute") {
-    return substr(ts, 1, 16)
-  } else if (interval == "hour") {
-    return substr(ts, 1, 13)
-  } else if (interval == "day") {
-    return substr(ts, 1, 10)
-  } else if (interval == "month") {
-    return substr(ts, 1, 7)
-  } else if (interval == "week") {
-    cmd = "date -d \"" ts "\" +%G-W%V"
-    cmd | getline out
-    close(cmd)
-    return out
-  }
-  return ts
-}
-
-function next_interval(ts,    cmd, out) {
-  if (interval == "hour") cmd = "date -d \"" ts " +1 hour\" +%Y-%m-%dT%H"
-  else if (interval == "day") cmd = "date -d \"" ts " +1 day\" +%Y-%m-%d"
-  else if (interval == "minute") cmd = "date -d \"" ts " +1 min\" +%Y-%m-%dT%H:%M"
-  else if (interval == "month") cmd = "date -d \"" ts " +1 month\" +%Y-%m"
-  else if (interval == "week") cmd = "date -d \"" ts " +7 day\" +%Y-%m-%d"
-  cmd | getline out
-  close(cmd)
-  return out
-}
-
-{
-  ts = $0
-  if (in_range(ts)) {
-    key = truncate_ts(ts)
-    counts[key]++
-  }
-}
-
-END {
-  PROCINFO["sorted_in"] = "@ind_str_asc"
-
- if (fill_empty == 1) {
-    prev = ""
-    for (k in counts) {
-      if (prev != "") {
-        t = prev
-        while (1) {
-          next_ts = next_interval(t)
-          if (next_ts >= k) break
-          counts[next_ts] = 0
-          t = next_ts
-        }
-      }
-      prev = k
-    }
-  }
-
-
-  if (nohist == 1) {
-    for (k in counts) {
-      print k "\t" counts[k]
-    }
-    exit
-  }
-
-  max_count = 0
-  for (k in counts) {
-    if (counts[k] > max_count) max_count = counts[k]
-  }
-
-  term_width = 80
-  cmd = "tput cols"
-  cmd | getline term_width
-  close(cmd)
-
-  label_width = 25
-  bar_max_width = term_width - label_width
-  if (bar_max_width < 10) bar_max_width = 10
-
-  for (k in counts) {
-    count = counts[k]
-    bar_len = int((count / max_count) * bar_max_width)
-    if (bar_len < 1) bar_len = 1
-    bar = ""
-    for (i = 0; i < bar_len; i++) bar = bar "#"
-    printf "%-16s %5d %s\n", k, count, bar
-  }
-}
-'
-
+jq -r 'if type=="array" then .[] else . end | .time // .timestamp' "$input" \
+  | awk -v start="$START_TS" -v end="$END_TS" -v interval="$INTERVAL" \
+         -v nohist="$NO_HISTOGRAM" -v fill_empty="$FILL_EMPTY" -f "$SCRIPT_DIR/lib/hist.awk"
